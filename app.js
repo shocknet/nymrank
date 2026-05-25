@@ -6,7 +6,8 @@ const stream = require('stream')
 const path = require('path');
 const Database = require('./services/database');
 const RelayListener = require('./services/relay-listener');
-const { getRelayConfig } = require('./services/config');
+const BxrdWotSync = require('./services/bxrd-wot-sync');
+const { getRelayConfig, getBxrdConfig } = require('./services/config');
 
 // --- In-memory logger setup ---
 const logBuffer = []
@@ -37,12 +38,19 @@ const server = fastify({
 // --- Services ---
 const database = new Database();
 const relayConfig = getRelayConfig();
-const relayListener = new RelayListener(
-  relayConfig.rankingRelayUrls,
-  relayConfig.socialRelayUrls,
-  database,
-  server.log
-);
+const bxrdConfig = getBxrdConfig();
+const relayListener = bxrdConfig.disableRelays
+  ? null
+  : new RelayListener(
+      relayConfig.rankingRelayUrls,
+      relayConfig.socialRelayUrls,
+      database,
+      server.log
+    );
+let bxrdWotSync = null;
+if (bxrdConfig.syncEnabled) {
+  bxrdWotSync = new BxrdWotSync(database, server.log);
+}
 
 // --- Hooks ---
 server.addHook('onReady', async () => {
@@ -54,8 +62,17 @@ server.addHook('onReady', async () => {
       server.log.info('"--fresh" flag detected. Starting fresh backfill...');
     }
 
-    // Do not await this, let it run in the background
-    relayListener.start();
+    if (bxrdWotSync) {
+      const syncOnStart = bxrdConfig.syncOnStart;
+      if (syncOnStart) {
+        bxrdWotSync
+          .runOnce()
+          .catch((err) => server.log.error({ err }, 'BXRD initial sync failed'));
+      }
+      bxrdWotSync.startPoller({ skipImmediate: syncOnStart });
+    } else if (relayListener) {
+      relayListener.start();
+    }
   } catch (dbError) {
     server.log.warn('Database connection failed:', dbError.message);
   }
@@ -63,9 +80,11 @@ server.addHook('onReady', async () => {
 
 server.addHook('onClose', (instance, done) => {
   database.close().then(() => {
-    if (relayListener && relayListener.pool) {
-      const allRelays = [...relayListener.relayUrls, ...relayListener.profileRelayUrls];
-      relayListener.pool.close(allRelays);
+    if (bxrdWotSync) {
+      bxrdWotSync.stopPoller();
+    }
+    if (relayListener) {
+      relayListener.close();
     }
     done();
   }).catch(done);
@@ -204,6 +223,9 @@ const shutdown = async () => {
   }, 5000).unref();
   
   // Stop accepting new work
+  if (bxrdWotSync) {
+    bxrdWotSync.stopPoller();
+  }
   if (relayListener) {
     relayListener.close();
   }

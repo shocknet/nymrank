@@ -1,7 +1,14 @@
 'use strict';
 
+const { isBxrdPrimarySource, bxrdSourceFilterSql } = require('./bxrd-source');
+
 /** Matches home-page search (no committee perspective): blend + filters. */
 const MIN_RANK_VALUE = 35;
+
+function sourceFilterSql() {
+  if (!isBxrdPrimarySource()) return '';
+  return bxrdSourceFilterSql('ur');
+}
 
 const AGGREGATED_NAME_SEARCH_BODY = `
   SELECT
@@ -50,6 +57,7 @@ const AGGREGATED_NAME_SEARCH_BODY = `
     OR (LOWER(un.nip05) = LOWER($1) AND LOWER(un.lud16) = LOWER($1) AND un.nip05 IS NOT NULL AND un.lud16 IS NOT NULL)
   )
   AND ur.rank_value >= ${MIN_RANK_VALUE}
+  ${sourceFilterSql()}
   GROUP BY ur.ranked_user_pubkey, un.name, un.nip05, un.lud16, prq.last_activity_timestamp, un.profile_timestamp
   HAVING (
     CASE

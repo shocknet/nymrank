@@ -16,6 +16,13 @@ const DEFAULT_SOCIAL_RELAYS = [
   'wss://nostr.land'
 ];
 
+const DEFAULT_BXRD_API_BASE_URL = 'https://bxrd.app/api';
+
+function parseBool(value, defaultValue) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  return value === '1' || value.toLowerCase() === 'true';
+}
+
 function parseRelayList(value, fallback) {
   if (!value || typeof value !== 'string') {
     return [...fallback];
@@ -38,11 +45,32 @@ function getRelayConfig() {
   return {
     rankingRelayUrls: parseRelayList(process.env.RANKING_RELAY_URLS, DEFAULT_RANKING_RELAYS),
     socialRelayUrls,
-    // Backward-compatible alias in code paths that still reference profile relays.
     profileRelayUrls: socialRelayUrls
   };
 }
 
+function getBxrdConfig() {
+  const syncEnabled = parseBool(process.env.BXRD_SYNC_ENABLED, true);
+  const primarySource = parseBool(process.env.BXRD_PRIMARY_SOURCE, true);
+  const disableRelays = parseBool(
+    process.env.BXRD_DISABLE_RELAYS,
+    syncEnabled
+  );
+
+  return {
+    apiBaseUrl: (process.env.BXRD_API_BASE_URL || DEFAULT_BXRD_API_BASE_URL).replace(/\/$/, ''),
+    bearerToken: process.env.BXRD_ATTESTOR_BEARER_TOKEN || '',
+    syncEnabled,
+    syncOnStart: parseBool(process.env.BXRD_SYNC_ON_START, syncEnabled),
+    deltaPollMs: parseInt(process.env.BXRD_DELTA_POLL_MS, 10) || 30000,
+    disableRelays,
+    primarySource,
+    syncMode: process.env.BXRD_SYNC_MODE || 'upsert'
+  };
+}
+
 module.exports = {
-  getRelayConfig
+  getRelayConfig,
+  getBxrdConfig,
+  DEFAULT_BXRD_API_BASE_URL
 };

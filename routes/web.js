@@ -4,6 +4,11 @@ const {
   fetchAggregatedNameSearch,
   countAggregatedNameSearch
 } = require('../services/aggregated-name-search');
+const {
+  isBxrdPrimarySource,
+  bxrdSourceFilterSql,
+  bxrdUserProfileUrl
+} = require('../services/bxrd-source');
 
 /** Hide default/perspective listings when last-seen is older than this (still shown if unknown). */
 const LISTING_HIDE_LAST_SEEN_OLDER_THAN_DAYS = 365;
@@ -18,7 +23,9 @@ module.exports = async function (fastify, opts) {
     const limit = 50;
     const offset = (page - 1) * limit;
     const search = (request.query.search || '').trim();
-    const perspective = request.query.perspective || '';
+    const bxrdPrimary = isBxrdPrimarySource();
+    const bxrdSourceSql = bxrdPrimary ? bxrdSourceFilterSql('ur') : '';
+    const perspective = bxrdPrimary ? '' : (request.query.perspective || '');
     const includeStale =
       request.query.include_stale === '1' ||
       request.query.all === '1';
@@ -39,9 +46,13 @@ module.exports = async function (fastify, opts) {
           < INTERVAL '${LISTING_HIDE_LAST_SEEN_OLDER_THAN_DAYS} days'
     )`;
     
-    // Get committee members
-    const committeeResult = await database.query('SELECT name, pubkey FROM committee_members WHERE is_active = true ORDER BY name');
-    const committeeMembers = committeeResult.rows;
+    const committeeMembers = bxrdPrimary
+      ? []
+      : (
+          await database.query(
+            'SELECT name, pubkey FROM committee_members WHERE is_active = true ORDER BY name'
+          )
+        ).rows;
     
     let query, params;
     let queryParams = [];
@@ -137,8 +148,29 @@ module.exports = async function (fastify, opts) {
       `;
       params = [perspective, limit, offset];
       queryParams = [perspective];
+    } else if (bxrdPrimary) {
+      query = `
+        SELECT 
+          ur.ranked_user_pubkey,
+          un.name,
+          un.nip05,
+          un.lud16,
+          ur.rank_value,
+          ur.influence_score,
+          ur.hops,
+          ur.follower_count,
+          COALESCE(prq.last_activity_timestamp, un.profile_timestamp) as last_seen,
+          (ur.influence_score * LOG(GREATEST(ur.follower_count, 1) + 1)) as effective_score
+        FROM user_rankings ur
+        LEFT JOIN user_names un ON ur.ranked_user_pubkey = un.pubkey
+        LEFT JOIN profile_refresh_queue prq ON ur.ranked_user_pubkey = prq.pubkey
+        WHERE 1=1${bxrdSourceSql}
+        ${listingStaleAnd}
+        ORDER BY effective_score DESC NULLS LAST
+        LIMIT $1 OFFSET $2
+      `;
+      params = [limit, offset];
     } else {
-      // Default - use precomputed view (fast!)
       query = `
         SELECT 
           pr.ranked_user_pubkey,
@@ -211,8 +243,17 @@ module.exports = async function (fastify, opts) {
         AND ur.rank_value >= 35
         AND COALESCE(un.name_affinity, 0) >= 2
       `;
+    } else if (bxrdPrimary) {
+      countQuery = `
+        SELECT COUNT(DISTINCT ur.ranked_user_pubkey)
+        FROM user_rankings ur
+        LEFT JOIN user_names un ON ur.ranked_user_pubkey = un.pubkey
+        WHERE 1=1${bxrdSourceSql}
+        AND ur.rank_value >= 35
+        AND COALESCE(un.name_affinity, 0) >= 2
+      `;
+      queryParams = [];
     } else {
-      // Count occupied nyms: users with rank >= 35 and name_affinity >= 2
       countQuery = `
         SELECT COUNT(DISTINCT ur.ranked_user_pubkey)
         FROM user_rankings ur
@@ -241,6 +282,18 @@ module.exports = async function (fastify, opts) {
           ${listingStaleAnd}
         `,
           [perspective]
+        );
+        listTotal = parseInt(listed.rows[0].c, 10);
+      } else if (bxrdPrimary) {
+        const listed = await database.query(
+          `
+          SELECT COUNT(DISTINCT ur.ranked_user_pubkey)::bigint AS c
+          FROM user_rankings ur
+          LEFT JOIN user_names un ON ur.ranked_user_pubkey = un.pubkey
+          LEFT JOIN profile_refresh_queue prq ON ur.ranked_user_pubkey = prq.pubkey
+          WHERE 1=1${bxrdSourceSql}
+          ${listingStaleAnd}
+        `
         );
         listTotal = parseInt(listed.rows[0].c, 10);
       } else {
@@ -273,6 +326,21 @@ module.exports = async function (fastify, opts) {
     const displayRows = (search && hasGreenResults)
       ? rowsWithScores.filter(r => r._effectiveScore >= 1.0)  // Filter out grey when greens exist in search
       : rowsWithScores;
+
+    const perspectiveControl = bxrdPrimary
+      ? '<div class="perspective-select" style="padding:12px;color:#888;font-size:14px;">Source: BXRD WoT</div>'
+      : `<div class="perspective-select">
+          <select name="perspective" onchange="this.form.submit()">
+            <option value="">Average</option>
+            ${committeeMembers.map(m => {
+              let label = m.name;
+              if (m.name.toLowerCase() === 'straycat') label += ' (Default)';
+              else if (m.name.toLowerCase() === 'justin') label += ' (Permissive)';
+              else if (m.name.toLowerCase() === 'vinny') label += ' (Restrictive)';
+              return `<option value="${m.pubkey}" ${perspective === m.pubkey ? 'selected' : ''}>${label}</option>`;
+            }).join('')}
+          </select>
+        </div>`;
     
     const html = `
 <!DOCTYPE html>
@@ -455,18 +523,7 @@ module.exports = async function (fastify, opts) {
           <input type="text" name="search" placeholder="Check slug availability (e.g., 'jack')..." value="${search}">
           <button type="submit" class="search-btn">Search</button>
         </div>
-        <div class="perspective-select">
-          <select name="perspective" onchange="this.form.submit()">
-            <option value="">Average</option>
-            ${committeeMembers.map(m => {
-              let label = m.name;
-              if (m.name.toLowerCase() === 'straycat') label += ' (Default)';
-              else if (m.name.toLowerCase() === 'justin') label += ' (Permissive)';
-              else if (m.name.toLowerCase() === 'vinny') label += ' (Restrictive)';
-              return `<option value="${m.pubkey}" ${perspective === m.pubkey ? 'selected' : ''}>${label}</option>`;
-            }).join('')}
-          </select>
-        </div>
+        ${perspectiveControl}
       </div>
     </form>
     
@@ -543,7 +600,7 @@ module.exports = async function (fastify, opts) {
               <td>${row.nip05 || '-'}</td>
               <td class="hide-mobile">${row.lud16 || '-'}</td>
               <td>
-                <a href="https://primal.net/p/${fullPubkey}" target="_blank" class="pubkey" title="${fullPubkey}">
+                <a href="${bxrdUserProfileUrl(fullPubkey)}" target="_blank" rel="noopener noreferrer" class="pubkey" title="${fullPubkey}">
                   <span class="pubkey-desktop">${desktopPubkey}</span>
                   <span class="pubkey-mobile">${mobilePubkey}</span>
                 </a>
@@ -666,7 +723,7 @@ module.exports = async function (fastify, opts) {
     <a href="/" class="back">← Back to Rankings</a>
     
     <h1>${profile?.name || 'Unknown User'}</h1>
-    <div class="pubkey-full">${pubkey}</div>
+    <div class="pubkey-full"><a href="${bxrdUserProfileUrl(pubkey)}" target="_blank" rel="noopener noreferrer" style="color: #888;">${pubkey}</a></div>
     
     ${profile ? `
     <div class="section">

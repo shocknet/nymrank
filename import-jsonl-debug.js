@@ -1,4 +1,5 @@
 const fs = require('fs');
+const path = require('path');
 const readline = require('readline');
 const Database = require('./services/database');
 const EventProcessor = require('./services/event-processor');
@@ -14,9 +15,11 @@ async function importAttestations() {
   await database.ensureAttestationEventsTable();
   
   const eventProcessor = new EventProcessor(database, log);
-  
+
+  const inputPath = process.argv[2] || path.join(__dirname, 'attestations.jsonl');
+
   const rl = readline.createInterface({
-    input: fs.createReadStream('/home/justin/nymrank/attestations.jsonl'),
+    input: fs.createReadStream(inputPath),
     crlfDelay: Infinity
   });
 

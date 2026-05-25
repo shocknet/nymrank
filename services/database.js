@@ -1,29 +1,45 @@
-const { Pool } = require('pg');
+const { Pool, Client } = require('pg');
 
 class Database {
   constructor() {
     this.pool = null;
+    this.dbConfig = null;
     this.isConnected = false;
     this.isShuttingDown = false;
     this.listenClient = null;
     this.listenKeepAliveInterval = null;
+    this.listenReconnectTimer = null;
+    this.refreshInProgress = false;
+    this.refreshPending = false;
+    this.refreshDebounceTimer = null;
+  }
+
+  buildDbConfig() {
+    return {
+      host: process.env.DB_HOST || 'localhost',
+      port: Number(process.env.DB_PORT) || 5432,
+      database: process.env.DB_NAME || 'nymrank',
+      user: process.env.DB_USER || 'nymrank_user',
+      password: process.env.DB_PASSWORD || 'nymrank_password'
+    };
+  }
+
+  buildPoolConfig() {
+    return {
+      ...this.dbConfig,
+      max: Number(process.env.DB_POOL_MAX) || 10,
+      idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS) || 60000,
+      connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS) || 10000,
+      maxLifetimeSeconds: Number(process.env.DB_MAX_LIFETIME_SECONDS) || 1800,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000
+    };
   }
 
   async connect() {
     try {
-      // PostgreSQL connection configuration
-      const config = {
-        host: process.env.DB_HOST || 'localhost',
-        port: process.env.DB_PORT || 5432,
-        database: process.env.DB_NAME || 'nymrank',
-        user: process.env.DB_USER || 'nymrank_user',
-        password: process.env.DB_PASSWORD || 'nymrank_password',
-        max: 20, // Maximum number of clients in the pool
-        idleTimeoutMillis: 300000, // Close idle connections after 5 minutes (longer than keepalive delay)
-        connectionTimeoutMillis: 2000,
-        keepAlive: true,
-        keepAliveInitialDelayMillis: 10000, // Start keepalive probes after 10s of idle
-      };
+      this.dbConfig = this.buildDbConfig();
+      const config = this.buildPoolConfig();
 
       this.pool = new Pool(config);
       
@@ -50,17 +66,12 @@ class Database {
       });
       
       this.pool.on('remove', (client) => {
-        const isListenClient = this.listenClient && this.listenClient.processID === client?.processID;
         console.log('[DB Pool] Client removed:', {
           processId: client?.processID,
           timestamp: new Date().toISOString(),
           totalCount: this.pool.totalCount,
-          idleCount: this.pool.idleCount,
-          isListenClient: isListenClient
+          idleCount: this.pool.idleCount
         });
-        if (isListenClient) {
-          console.error('[DB Pool] WARNING: LISTEN client was removed! This should not happen.');
-        }
       });
       
       // Test the connection and check database timeout settings
@@ -112,6 +123,7 @@ class Database {
       console.log('Connected to PostgreSQL database');
       // Ensure auxiliary tables exist
       await this.ensureAttestationEventsTable();
+      await this.ensureBxrdSchema();
       
       // Set up listener for rankings refresh notifications
       await this.setupRankingsRefreshListener();
@@ -122,113 +134,136 @@ class Database {
     }
   }
   
+  clearListenKeepalive() {
+    if (this.listenKeepAliveInterval) {
+      clearInterval(this.listenKeepAliveInterval);
+      this.listenKeepAliveInterval = null;
+    }
+  }
+
+  scheduleListenReconnect(setupListener, delayMs = 5000) {
+    if (this.isShuttingDown || this.listenReconnectTimer) return;
+    this.listenReconnectTimer = setTimeout(() => {
+      this.listenReconnectTimer = null;
+      if (!this.isShuttingDown) {
+        console.log('[DB] Reconnecting dedicated LISTEN client...');
+        setupListener();
+      }
+    }, delayMs);
+  }
+
+  async teardownListenClient() {
+    this.clearListenKeepalive();
+    const client = this.listenClient;
+    this.listenClient = null;
+    if (!client) return;
+    try {
+      client.removeAllListeners();
+      await client.end();
+    } catch (_) {
+      // Ignore teardown errors on dead connections
+    }
+  }
+
+  startListenKeepalive() {
+    const intervalMs = Number(process.env.DB_LISTEN_KEEPALIVE_MS) || 60000;
+    this.clearListenKeepalive();
+    console.log(`[DB] LISTEN keepalive every ${intervalMs}ms (dedicated connection, not from pool)`);
+    this.listenKeepAliveInterval = setInterval(() => {
+      if (this.isShuttingDown || !this.listenClient) {
+        this.clearListenKeepalive();
+        return;
+      }
+      this.listenClient.query('SELECT 1').catch((err) => {
+        console.error('[DB] LISTEN keepalive failed:', err.message);
+      });
+    }, intervalMs);
+    if (this.listenKeepAliveInterval.unref) {
+      this.listenKeepAliveInterval.unref();
+    }
+  }
+
+  scheduleRankingsRefresh() {
+    if (this.refreshDebounceTimer) clearTimeout(this.refreshDebounceTimer);
+    this.refreshDebounceTimer = setTimeout(() => {
+      this.refreshDebounceTimer = null;
+      this.refreshPrecomputedRankings().catch((err) => {
+        console.error('[DB] Debounced materialized view refresh failed:', err.message);
+      });
+    }, 5000);
+  }
+
   async setupRankingsRefreshListener() {
     const setupListener = async () => {
+      if (this.isShuttingDown) return;
       try {
-        const client = await this.pool.connect();
+        await this.teardownListenClient();
+
+        const client = new Client(this.dbConfig);
+        await client.connect();
         await client.query('LISTEN rankings_changed');
-        
-        let refreshPending = false;
-        let refreshTimeout = null;
-        
-        const handleNotification = async (msg) => {
-          if (msg.channel === 'rankings_changed' && !refreshPending) {
-            // Debounce: wait 5 seconds after last change before refreshing
-            refreshPending = true;
-            if (refreshTimeout) clearTimeout(refreshTimeout);
-            refreshTimeout = setTimeout(async () => {
-              try {
-                console.log('[DB] Refreshing precomputed_rankings materialized view...');
-                await this.pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY precomputed_rankings');
-                console.log('[DB] Materialized view refreshed successfully');
-              } catch (err) {
-                console.error('[DB] Failed to refresh materialized view:', err.message);
-              }
-              refreshPending = false;
-            }, 5000);
-          }
-        };
-        
-        client.on('notification', handleNotification);
-        
-        // Store reference to prevent garbage collection
-        this.listenClient = client;
-        
-        // Send periodic keepalive queries to prevent PostgreSQL from dropping the connection
-        // PostgreSQL may have idle_in_transaction_session_timeout that can drop LISTEN connections
-        console.log('[DB] Starting LISTEN keepalive (every 4 minutes)');
-        this.listenKeepAliveInterval = setInterval(() => {
-          if (this.isShuttingDown || !this.listenClient) {
-            if (this.listenKeepAliveInterval) {
-              clearInterval(this.listenKeepAliveInterval);
-              this.listenKeepAliveInterval = null;
-            }
-            return;
-          }
-          // Use this.listenClient to ensure we're using the current client
-          this.listenClient.query('SELECT 1')
-            .then(() => {
-              // Keepalive successful - connection is alive
-            })
-            .catch((err) => {
-              console.error('[DB] LISTEN keepalive query failed:', err.message);
-            });
-        }, 4 * 60 * 1000); // Every 4 minutes (before 5 minute idle timeout)
-        
-        // Handle connection errors and reconnect
-        client.on('error', async (err) => {
-          console.error('[DB] LISTEN connection error:', err.message);
-          client.removeAllListeners();
-          this.listenClient = null;
-          if (this.listenKeepAliveInterval) {
-            clearInterval(this.listenKeepAliveInterval);
-            this.listenKeepAliveInterval = null;
-          }
-          try {
-            client.release();
-          } catch (e) {
-            // Ignore release errors
-          }
-          // Reconnect after a delay
-          if (!this.isShuttingDown) {
-            setTimeout(() => {
-              if (!this.isShuttingDown) {
-                console.log('[DB] Reconnecting LISTEN client...');
-                setupListener();
-              }
-            }, 5000);
+
+        client.on('notification', (msg) => {
+          if (msg.channel === 'rankings_changed') {
+            this.scheduleRankingsRefresh();
           }
         });
-        
-        console.log('[DB] Listening for rankings_changed notifications');
+
+        client.on('error', (err) => {
+          console.error('[DB] LISTEN connection error:', err.message);
+          this.teardownListenClient().finally(() => {
+            this.scheduleListenReconnect(setupListener);
+          });
+        });
+
+        this.listenClient = client;
+        this.startListenKeepalive();
+        console.log('[DB] Listening for rankings_changed (dedicated connection)');
       } catch (error) {
         console.error('[DB] Failed to setup rankings refresh listener:', error.message);
-        // Retry after delay if not shutting down
-        if (!this.isShuttingDown) {
-          setTimeout(() => {
-            if (!this.isShuttingDown) {
-              setupListener();
-            }
-          }, 10000);
-        }
+        this.scheduleListenReconnect(setupListener, 10000);
       }
     };
-    
+
     await setupListener();
   }
   
   async refreshRankings() {
+    return this.refreshPrecomputedRankings();
+  }
+
+  async setRankingsRefreshEnabled(enabled) {
+    const sql = enabled
+      ? 'ALTER TABLE user_rankings ENABLE TRIGGER rankings_changed_trigger'
+      : 'ALTER TABLE user_rankings DISABLE TRIGGER rankings_changed_trigger';
+    await this.query(sql);
+  }
+
+  async refreshPrecomputedRankings() {
+    if (this.refreshInProgress) {
+      this.refreshPending = true;
+      return;
+    }
+    this.refreshInProgress = true;
     try {
-      console.log('[DB] Manually refreshing precomputed_rankings...');
-      await this.pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY precomputed_rankings');
-      console.log('[DB] Materialized view refreshed');
-    } catch (error) {
-      console.error('[DB] Failed to refresh rankings:', error.message);
-      throw error;
+      console.log('[DB] Refreshing precomputed_rankings materialized view...');
+      await this.query('REFRESH MATERIALIZED VIEW CONCURRENTLY precomputed_rankings');
+      console.log('[DB] Materialized view refreshed successfully');
+    } finally {
+      this.refreshInProgress = false;
+      if (this.refreshPending) {
+        this.refreshPending = false;
+        await this.refreshPrecomputedRankings();
+      }
     }
   }
 
-  async query(text, params, retries = 2) {
+  connectionRetryDelayMs(attempt, maxRetries) {
+    const attemptIndex = maxRetries - attempt;
+    return Math.min(100 * (2 ** attemptIndex), 2000);
+  }
+
+  async query(text, params, retries = 3) {
     if (!this.isConnected || this.isShuttingDown) {
       return { rows: [], rowCount: 0 }; // Return empty result during shutdown
     }
@@ -266,13 +301,14 @@ class Database {
         });
       }
       
-      // For connection errors, get a fresh client explicitly to force pool to create new connection
       if (isConnectionError && retries > 0) {
         const attemptsLeft = retries - 1;
-        console.warn(`Database connection error, getting fresh client (${attemptsLeft} attempts left):`, error.message);
-        
-        // Wait a bit to let pool clean up the dead connection
-        await new Promise(resolve => setTimeout(resolve, 100));
+        const delayMs = this.connectionRetryDelayMs(attemptsLeft, retries);
+        console.warn(
+          `Database connection error, retrying in ${delayMs}ms (${attemptsLeft} attempts left):`,
+          error.message
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
         
         try {
           // Get a fresh client explicitly - this forces pool to create new connection if needed
@@ -401,19 +437,15 @@ class Database {
 
   async disconnect() {
     this.isShuttingDown = true;
-    if (this.listenKeepAliveInterval) {
-      clearInterval(this.listenKeepAliveInterval);
-      this.listenKeepAliveInterval = null;
+    if (this.refreshDebounceTimer) {
+      clearTimeout(this.refreshDebounceTimer);
+      this.refreshDebounceTimer = null;
     }
-    if (this.listenClient) {
-      try {
-        this.listenClient.removeAllListeners();
-        this.listenClient.release();
-      } catch (e) {
-        // Ignore errors
-      }
-      this.listenClient = null;
+    if (this.listenReconnectTimer) {
+      clearTimeout(this.listenReconnectTimer);
+      this.listenReconnectTimer = null;
     }
+    await this.teardownListenClient();
     if (this.pool) {
       await this.pool.end();
       this.isConnected = false;
@@ -677,6 +709,169 @@ class Database {
     const query = 'SELECT delegator_pubkey FROM delegations WHERE service_pubkey = $1';
     const result = await this.query(query, [servicePubkey]);
     return result.rows.length > 0 ? result.rows[0].delegator_pubkey : null;
+  }
+
+  async ensureBxrdSchema() {
+    const fs = require('fs');
+    const path = require('path');
+    const migrationsDir = path.join(__dirname, '..', 'migrations');
+    for (const file of ['002_bxrd_sentinel.sql', '003_bxrd_ranking_source.sql']) {
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      await this.pool.query(sql);
+    }
+  }
+
+  async getBxrdSyncState() {
+    const result = await this.query(
+      'SELECT last_since_ms, last_snapshot_etag, last_snapshot_at, last_delta_at FROM bxrd_sync_state WHERE id = 1'
+    );
+    return result.rows[0] || {
+      last_since_ms: null,
+      last_snapshot_etag: null,
+      last_snapshot_at: null,
+      last_delta_at: null
+    };
+  }
+
+  async setBxrdSyncState(partial) {
+    const fields = [];
+    const params = [];
+    let i = 1;
+
+    if (partial.last_since_ms !== undefined) {
+      fields.push(`last_since_ms = $${i++}`);
+      params.push(partial.last_since_ms);
+    }
+    if (partial.last_snapshot_etag !== undefined) {
+      fields.push(`last_snapshot_etag = $${i++}`);
+      params.push(partial.last_snapshot_etag);
+    }
+    if (partial.last_snapshot_at !== undefined) {
+      fields.push(`last_snapshot_at = $${i++}`);
+      params.push(partial.last_snapshot_at);
+    }
+    if (partial.last_delta_at !== undefined) {
+      fields.push(`last_delta_at = $${i++}`);
+      params.push(partial.last_delta_at);
+    }
+
+    fields.push('updated_at = CURRENT_TIMESTAMP');
+
+    await this.query(
+      `UPDATE bxrd_sync_state SET ${fields.join(', ')} WHERE id = 1`,
+      params
+    );
+  }
+
+  async bulkUpsertBxrdRankings(rankings) {
+    if (!rankings.length) return;
+
+    const CHUNK = 500;
+    for (let i = 0; i < rankings.length; i += CHUNK) {
+      const chunk = rankings.slice(i, i + CHUNK);
+      const pubkeys = chunk.map((r) => r.ranked_user_pubkey);
+      const sources = chunk.map((r) => r.ranking_source);
+      const services = chunk.map((r) => r.service_pubkey);
+      const committees = chunk.map((r) => r.committee_member_pubkey);
+      const ranks = chunk.map((r) => r.rank_value);
+      const hops = chunk.map((r) => r.hops);
+      const influences = chunk.map((r) => r.influence_score);
+      const averages = chunk.map((r) => r.average_score);
+      const confidences = chunk.map((r) => r.confidence_score);
+      const inputs = chunk.map((r) => r.input_value);
+      const pageranks = chunk.map((r) => r.pagerank_score);
+      const followers = chunk.map((r) => r.follower_count);
+      const muters = chunk.map((r) => r.muter_count);
+      const reporters = chunk.map((r) => r.reporter_count);
+      const timestamps = chunk.map((r) => r.event_timestamp);
+
+      await this.query(
+        `
+        INSERT INTO user_rankings (
+          ranked_user_pubkey, ranking_source, service_pubkey, committee_member_pubkey,
+          rank_value, hops, influence_score, average_score, confidence_score,
+          input_value, pagerank_score, follower_count, muter_count, reporter_count,
+          event_timestamp
+        )
+        SELECT * FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::text[],
+          $5::int[], $6::int[], $7::float8[], $8::float8[], $9::float8[],
+          $10::float8[], $11::float8[], $12::int[], $13::int[], $14::int[],
+          $15::timestamptz[]
+        )
+        ON CONFLICT (ranked_user_pubkey, service_pubkey, committee_member_pubkey)
+        DO UPDATE SET
+          ranking_source = EXCLUDED.ranking_source,
+          rank_value = EXCLUDED.rank_value,
+          hops = EXCLUDED.hops,
+          influence_score = EXCLUDED.influence_score,
+          average_score = EXCLUDED.average_score,
+          confidence_score = EXCLUDED.confidence_score,
+          input_value = EXCLUDED.input_value,
+          pagerank_score = EXCLUDED.pagerank_score,
+          follower_count = EXCLUDED.follower_count,
+          muter_count = EXCLUDED.muter_count,
+          reporter_count = EXCLUDED.reporter_count,
+          event_timestamp = EXCLUDED.event_timestamp,
+          last_updated = CURRENT_TIMESTAMP
+        `,
+        [
+          pubkeys, sources, services, committees, ranks, hops, influences, averages,
+          confidences, inputs, pageranks, followers, muters, reporters, timestamps
+        ]
+      );
+    }
+  }
+
+  async bulkUpsertBxrdProfiles(profiles) {
+    if (!profiles.length) return;
+
+    const CHUNK = 500;
+    for (let i = 0; i < profiles.length; i += CHUNK) {
+      const chunk = profiles.slice(i, i + CHUNK);
+
+      for (const p of chunk) {
+        let nameAffinity = 0;
+        if (p.name) nameAffinity += 2;
+        if (p.nip05) nameAffinity += 1;
+        if (p.lud16) nameAffinity += 1;
+        const primaryName = p.name || p.nip05 || p.lud16 || null;
+        const profileTs = p.profile_timestamp || p.last_seen_at || 0;
+
+        await this.query(
+          `
+          INSERT INTO user_names (pubkey, name, nip05, lud16, name_affinity, primary_name, profile_timestamp)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          ON CONFLICT (pubkey) DO UPDATE SET
+            name = EXCLUDED.name,
+            nip05 = EXCLUDED.nip05,
+            lud16 = EXCLUDED.lud16,
+            name_affinity = EXCLUDED.name_affinity,
+            primary_name = EXCLUDED.primary_name,
+            profile_timestamp = CASE
+              WHEN EXCLUDED.profile_timestamp > 0 THEN GREATEST(COALESCE(user_names.profile_timestamp, 0), EXCLUDED.profile_timestamp)
+              ELSE user_names.profile_timestamp
+            END,
+            last_updated = CURRENT_TIMESTAMP
+          `,
+          [p.pubkey, p.name, p.nip05, p.lud16, nameAffinity, primaryName, profileTs]
+        );
+
+        const queueProfileTs = profileTs > 0 ? profileTs : p.last_seen_at || 0;
+        const activityTs = p.last_seen_at || queueProfileTs;
+
+        await this.query(
+          `
+          INSERT INTO profile_refresh_queue (pubkey, profile_timestamp, last_activity_timestamp)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (pubkey) DO UPDATE SET
+            profile_timestamp = GREATEST(profile_refresh_queue.profile_timestamp, EXCLUDED.profile_timestamp),
+            last_activity_timestamp = GREATEST(COALESCE(profile_refresh_queue.last_activity_timestamp, 0), EXCLUDED.last_activity_timestamp)
+          `,
+          [p.pubkey, queueProfileTs, activityTs]
+        );
+      }
+    }
   }
 }
 

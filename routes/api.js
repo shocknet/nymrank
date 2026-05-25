@@ -1,9 +1,11 @@
 'use strict';
 
 const { decode } = require('nostr-tools/nip19');
-const { getRelayConfig } = require('../services/config');
+const { getRelayConfig, getBxrdConfig } = require('../services/config');
 const { runAdhocActivityCheck } = require('../services/activity-check');
+const { fetchActivityFromDb } = require('../services/bxrd-activity');
 const { fetchAggregatedNameSearch } = require('../services/aggregated-name-search');
+const { isBxrdPrimarySource, bxrdSourceFilterSql } = require('../services/bxrd-source');
 
 function sendApiError(reply, statusCode, code, message) {
   return reply.code(statusCode).send({
@@ -116,6 +118,10 @@ module.exports = async function (fastify) {
     }
 
     try {
+      const bxrdOnly = isBxrdPrimarySource();
+      const sourceFilter = bxrdOnly ? bxrdSourceFilterSql('ur') : '';
+      const aggregateParams = [normalizedPubkey];
+
       const aggregateQuery = `
         SELECT
           ur.ranked_user_pubkey AS pubkey,
@@ -130,11 +136,11 @@ module.exports = async function (fastify) {
           un.name_affinity
         FROM user_rankings ur
         LEFT JOIN user_names un ON ur.ranked_user_pubkey = un.pubkey
-        WHERE ur.ranked_user_pubkey = $1
+        WHERE ur.ranked_user_pubkey = $1${sourceFilter}
         GROUP BY ur.ranked_user_pubkey, un.name, un.nip05, un.lud16, un.name_affinity
         LIMIT 1
       `;
-      const aggregateResult = await database.query(aggregateQuery, [normalizedPubkey]);
+      const aggregateResult = await database.query(aggregateQuery, aggregateParams);
       const aggregate = aggregateResult.rows[0];
 
       if (!aggregate) {
@@ -142,12 +148,12 @@ module.exports = async function (fastify) {
       }
 
       const committeeQuery = `
-        SELECT committee_member_pubkey, rank_value, influence_score, hops, follower_count
-        FROM user_rankings
-        WHERE ranked_user_pubkey = $1
-        ORDER BY rank_value DESC, committee_member_pubkey ASC
+        SELECT ur.committee_member_pubkey, ur.rank_value, ur.influence_score, ur.hops, ur.follower_count
+        FROM user_rankings ur
+        WHERE ur.ranked_user_pubkey = $1${sourceFilter}
+        ORDER BY ur.rank_value DESC, ur.committee_member_pubkey ASC
       `;
-      const committeeResult = await database.query(committeeQuery, [normalizedPubkey]);
+      const committeeResult = await database.query(committeeQuery, aggregateParams);
 
       return {
         pubkey: normalizedPubkey,
@@ -183,6 +189,9 @@ module.exports = async function (fastify) {
     }
 
     try {
+      if (getBxrdConfig().disableRelays) {
+        return await fetchActivityFromDb(database, normalizedPubkey);
+      }
       return await runAdhocActivityCheck({
         database,
         relayUrls: socialRelayUrls,

@@ -9,6 +9,8 @@
   "scripts": {
     "start": "node --expose-gc app.js",
     "refresh": "node app.js --fresh",
+    "import:bxrd": "node scripts/import-bxrd-wot.js",
+    "import:bxrd:seed": "node scripts/import-bxrd-wot.js --seed",
     "test": "tap \"test/**/*.test.js\""
   },
   "keywords": [],

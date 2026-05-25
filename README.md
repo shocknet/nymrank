@@ -40,7 +40,9 @@ These keys are used to:
 - Map service keys to committee members for ranking events (kind 30382)
 - Store per-member rows in `user_rankings` and average at query time (and via `precomputed_rankings`)
 
-**Ingestion note:** Kind **10040** and **30382** are loaded by **`backfill-attestations.js`** (and optional JSONL importers). `RelayListener` only runs periodic **kind 0 + activity** fetches on **social** relays; it does **not** poll ranking relays for new delegations or attestations (handlers exist but are not invoked from startup).
+**Ingestion (BXRD, default):** Rankings and profiles come from the [BXRD WoT attestor API](https://bxrd.app/api) (`GET /wot/export.ndjson.gz` seed/reconcile, `GET /wot?since=<unix_ms>` delta). Delta cursor advances from `data.next_since_ms` (or `max(entries[].attestor_changed_at) * 1000 + 1`). Do not use `updated_at` (batch ISO) or `last_seen_at` (informational) for the cursor. Rows are tagged `ranking_source = 'bxrd'`. Set `BXRD_ATTESTOR_BEARER_TOKEN` and run `npm run import:bxrd:seed` once, then the app poller keeps data fresh.
+
+**Legacy ingestion (optional):** Kind **10040** and **30382** via **`backfill-attestations.js`** / JSONL importers (`ranking_source = 'nostr'`). Disable relay fetches with `BXRD_DISABLE_RELAYS=true`.
 
 ## Setup
 
@@ -162,8 +164,11 @@ Periodic scheduling: a **6 hour** `setInterval` triggers checks. While a run is 
 - `DB_NAME`: Database name (default: nymrank)
 - `DB_USER`: Database user (default: nymrank_user)
 - `DB_PASSWORD`: Database password (default: nymrank_password)
-- `RANKING_RELAY_URLS`: Comma-separated relay list for ranking/delegation (default: `wss://nip85.brainstorm.world`)
-- `SOCIAL_RELAY_URLS`: Comma-separated relay list shared by profile fetching and activity checks
+- `BXRD_API_BASE_URL`: Attestor base (default: `https://bxrd.app/api`)
+- `BXRD_ATTESTOR_BEARER_TOKEN`: Shared Bearer token (required for sync)
+- `BXRD_SYNC_ENABLED`, `BXRD_SYNC_ON_START`, `BXRD_DELTA_POLL_MS` (default 30000)
+- `BXRD_DISABLE_RELAYS`, `BXRD_PRIMARY_SOURCE`: Skip relay scraping; UI/API read `ranking_source = 'bxrd'` only
+- `RANKING_RELAY_URLS`, `SOCIAL_RELAY_URLS`: Legacy relay ingest when relays enabled
 
 Copy `.env.example` to `.env` and set secrets locally:
 
