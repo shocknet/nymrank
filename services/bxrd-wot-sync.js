@@ -2,7 +2,11 @@
 
 const BxrdWotClient = require('./bxrd-wot-client');
 const { mapAttestorRows } = require('./bxrd-wot-mapper');
-const { computeNextSinceMs } = require('./bxrd-wot-cursor');
+const {
+  computeNextSinceMs,
+  trackMaxAttestorChangedSec,
+  sinceMsFromMaxSec
+} = require('./bxrd-wot-cursor');
 const { getBxrdConfig } = require('./config');
 
 class BxrdWotSync {
@@ -37,8 +41,8 @@ class BxrdWotSync {
       return this.runDeltaPoll(state);
     }
 
-    this.log.info('[BXRD] Snapshot etag changed — full reconcile');
-    return this.ingestSnapshotStream(snapshot, { advanceSince: true });
+    this.log.info('[BXRD] Snapshot etag changed — full reconcile (delta cursor unchanged)');
+    return this.ingestSnapshotStream(snapshot, { seedCursor: false });
   }
 
   async runSnapshotSeed() {
@@ -47,13 +51,19 @@ class BxrdWotSync {
       this.log.warn('[BXRD] Seed requested but got 304');
       return { seeded: false };
     }
-    return this.ingestSnapshotStream(snapshot, { advanceSince: true });
+    return this.ingestSnapshotStream(snapshot, { seedCursor: true });
   }
 
-  async ingestSnapshotStream(snapshot, { advanceSince }) {
+  /**
+   * @param {{ seedCursor: boolean }} opts
+   * seedCursor: true only on first gzip seed — sets last_since_ms from export.
+   * Nightly reconcile (seedCursor false) refreshes rows but keeps last_since_ms from delta polls.
+   */
+  async ingestSnapshotStream(snapshot, { seedCursor }) {
     const batch = [];
     const BATCH = 500;
     let lineCount = 0;
+    let maxAttestorSec = 0;
 
     await this.database.setRankingsRefreshEnabled(false);
     try {
@@ -62,36 +72,39 @@ class BxrdWotSync {
         lineCount++;
         if (batch.length >= BATCH) {
           await this.upsertBatch(batch);
+          maxAttestorSec = trackMaxAttestorChangedSec(batch, maxAttestorSec);
           batch.length = 0;
         }
       }
       if (batch.length > 0) {
         await this.upsertBatch(batch);
+        maxAttestorSec = trackMaxAttestorChangedSec(batch, maxAttestorSec);
       }
     } finally {
       await this.database.setRankingsRefreshEnabled(true);
       await this.database.refreshPrecomputedRankings();
     }
 
-    const sinceMs = advanceSince ? Date.now() : undefined;
-    await this.database.setBxrdSyncState({
+    const syncPatch = {
       last_snapshot_etag: snapshot.etag,
-      last_snapshot_at: snapshot.computedAt ? new Date(snapshot.computedAt) : new Date(),
-      last_since_ms: sinceMs
-    });
+      last_snapshot_at: snapshot.computedAt ? new Date(snapshot.computedAt) : new Date()
+    };
+    if (seedCursor) {
+      syncPatch.last_since_ms = sinceMsFromMaxSec(maxAttestorSec);
+    }
+    await this.database.setBxrdSyncState(syncPatch);
 
     this.log.info(
-      { lines: lineCount, etag: snapshot.etag },
+      { lines: lineCount, etag: snapshot.etag, seedCursor, deltaSinceMs: syncPatch.last_since_ms ?? null },
       '[BXRD] Snapshot ingest complete (single materialized view refresh)'
     );
     return { snapshot: true, lines: lineCount, etag: snapshot.etag };
   }
 
   async runDeltaPoll(state) {
-    const pollStartMs = Date.now();
     let sinceMs = state.last_since_ms;
-    if (!sinceMs || sinceMs <= 0) {
-      sinceMs = pollStartMs - 60000;
+    if (sinceMs == null || sinceMs <= 0) {
+      sinceMs = 0;
     }
 
     try {
@@ -107,10 +120,7 @@ class BxrdWotSync {
         await this.upsertBatch(entries);
       }
 
-      const nextSinceMs =
-        entries.length > 0
-          ? computeNextSinceMs(entries, data, pollStartMs)
-          : pollStartMs;
+      const nextSinceMs = computeNextSinceMs(entries, sinceMs);
 
       await this.database.setBxrdSyncState({
         last_since_ms: nextSinceMs,
@@ -124,7 +134,7 @@ class BxrdWotSync {
         since: sinceMs,
         sinceSec: data.since_sec ?? Math.floor(sinceMs / 1000),
         nextSince: nextSinceMs,
-        bxrdNextSinceMs: data.next_since_ms ?? null,
+        sinceUnchanged: nextSinceMs === sinceMs,
         repeatPubkeys: repeatCount
       };
       if (entries.length > 0 && repeatCount === entries.length) {
@@ -138,8 +148,8 @@ class BxrdWotSync {
       return { delta: true, entries: entries.length, repeatPubkeys: repeatCount };
     } catch (err) {
       if (err.statusCode === 400) {
-        this.log.warn({ err }, '[BXRD] Delta since invalid — resetting cursor');
-        await this.database.setBxrdSyncState({ last_since_ms: pollStartMs });
+        this.log.warn({ err }, '[BXRD] Delta since invalid — resetting cursor to bootstrap');
+        await this.database.setBxrdSyncState({ last_since_ms: 0 });
       }
       throw err;
     }

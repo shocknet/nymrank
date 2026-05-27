@@ -1,34 +1,43 @@
 'use strict';
 
 /**
- * BXRD delta filter: max(wot_updated_at, profile_updated_at) >= floor(since_ms / 1000).
- * Cursor must use attestor_changed_at / next_since_ms — not updated_at or last_seen_at.
+ * BXRD delta: attestor_changed_at > floor(since_ms / 1000) (strict).
+ * NymRank owns the cursor — BXRD does not return next_since_ms.
  */
-function entryAttestorChangedMs(row) {
-  const changedSec = Number(row.attestor_changed_at);
-  if (changedSec > 0) return changedSec * 1000;
 
-  const wotSec = Number(row.wot_updated_at);
-  const profileSec = Number(row.profile_updated_at);
-  const secs = [wotSec, profileSec].filter((s) => s > 0);
-  return secs.length ? Math.max(...secs) * 1000 : 0;
+function maxAttestorChangedSec(rows) {
+  let maxSec = 0;
+  for (const row of rows || []) {
+    const sec = Number(row.attestor_changed_at);
+    if (sec > maxSec) maxSec = sec;
+  }
+  return maxSec;
 }
 
-function computeNextSinceMs(entries, deltaData, pollStartMs) {
-  const serverNext = Number(deltaData?.next_since_ms);
-  if (Number.isFinite(serverNext) && serverNext > 0) {
-    return serverNext;
-  }
+function trackMaxAttestorChangedSec(rows, currentMaxSec = 0) {
+  return Math.max(currentMaxSec, maxAttestorChangedSec(rows));
+}
 
-  let next = pollStartMs;
-  for (const row of entries || []) {
-    const rowMs = entryAttestorChangedMs(row);
-    if (rowMs > 0) next = Math.max(next, rowMs);
+/** After a delta poll: advance only when entries were applied. */
+function computeNextSinceMs(entries, sinceMs) {
+  if (!entries?.length) {
+    return sinceMs;
   }
-  return next + 1;
+  const maxSec = maxAttestorChangedSec(entries);
+  if (maxSec <= 0) {
+    return sinceMs;
+  }
+  const next = maxSec * 1000 + 1;
+  return Math.max(next, sinceMs);
+}
+
+function sinceMsFromMaxSec(maxSec) {
+  return maxSec > 0 ? maxSec * 1000 + 1 : 0;
 }
 
 module.exports = {
-  entryAttestorChangedMs,
-  computeNextSinceMs
+  computeNextSinceMs,
+  trackMaxAttestorChangedSec,
+  sinceMsFromMaxSec,
+  maxAttestorChangedSec
 };

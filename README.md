@@ -40,7 +40,7 @@ These keys are used to:
 - Map service keys to committee members for ranking events (kind 30382)
 - Store per-member rows in `user_rankings` and average at query time (and via `precomputed_rankings`)
 
-**Ingestion (BXRD, default):** Rankings and profiles come from the [BXRD WoT attestor API](https://bxrd.app/api) (`GET /wot/export.ndjson.gz` seed/reconcile, `GET /wot?since=<unix_ms>` delta). Delta cursor advances from `data.next_since_ms` (or `max(entries[].attestor_changed_at) * 1000 + 1`). Do not use `updated_at` (batch ISO) or `last_seen_at` (informational) for the cursor. Rows are tagged `ranking_source = 'bxrd'`. Set `BXRD_ATTESTOR_BEARER_TOKEN` and run `npm run import:bxrd:seed` once, then the app poller keeps data fresh.
+**Ingestion (BXRD, default):** Rankings and profiles come from the [BXRD WoT attestor API](https://bxrd.app/api). **Daytime:** `GET /wot?since=<last_since_ms>` every ~30s; cursor advances only when entries are applied (`max(attestor_changed_at) * 1000 + 1`, unchanged on empty poll). **Nightly:** `GET /wot/export.ndjson.gz` (new ETag) full-reconciles rows but does **not** reset `last_since_ms` — intraday accuracy stays on the delta cursor. **First run:** gzip seed sets etag + initial `last_since_ms` from the export. Rows are tagged `ranking_source = 'bxrd'`. Set `BXRD_ATTESTOR_BEARER_TOKEN` and run `npm run import:bxrd:seed` once, then the app poller keeps data fresh.
 
 **Legacy ingestion (optional):** Kind **10040** and **30382** via **`backfill-attestations.js`** / JSONL importers (`ranking_source = 'nostr'`). Disable relay fetches with `BXRD_DISABLE_RELAYS=true`.
 
@@ -133,7 +133,7 @@ The app will:
 - `GET /` - Main search/browse UI
 - `GET /faq` - FAQ page (served from `/public/faq.html`)
 - `GET /api-docs` - Interactive API page (form inputs + live JSON responses)
-- `GET /api/status` - API health/readiness
+- `GET /api/status` - Health/readiness: DB, BXRD API (when sync/primary), BXRD row counts, sync freshness, sample rank lookup (`503` if any required check fails)
 - `GET /api/names/:name` - Resolve name occupancy (`pubkey`, `average_rank`, `name_affinity`)
 - `GET /api/users/:pubkey/rank` - Averaged user rank and committee breakdown
 - `GET /api/users/:pubkey/activity` - Ad-hoc activity + profile refresh (hex or npub; same family as `/api/users/:pubkey/rank`)

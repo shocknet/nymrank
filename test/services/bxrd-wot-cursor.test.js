@@ -4,44 +4,40 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   computeNextSinceMs,
-  entryAttestorChangedMs
+  trackMaxAttestorChangedSec,
+  sinceMsFromMaxSec
 } = require('../../services/bxrd-wot-cursor');
 
 describe('bxrd-wot-cursor', () => {
-  it('entryAttestorChangedMs prefers attestor_changed_at', () => {
-    const row = {
-      attestor_changed_at: 1779728142,
-      wot_updated_at: 1,
-      profile_updated_at: 9999999999,
-      updated_at: '2026-05-25T17:55:04.851Z',
-      last_seen_at: 1709228985
-    };
-    assert.equal(entryAttestorChangedMs(row), 1779728142000);
+  it('empty delta keeps since unchanged', () => {
+    const sinceMs = 1779853984001;
+    assert.equal(computeNextSinceMs([], sinceMs), sinceMs);
+    assert.equal(computeNextSinceMs(null, sinceMs), sinceMs);
   });
 
-  it('entryAttestorChangedMs falls back to max wot and profile', () => {
-    const row = { wot_updated_at: 100, profile_updated_at: 200 };
-    assert.equal(entryAttestorChangedMs(row), 200000);
+  it('non-empty delta uses max attestor_changed_at * 1000 + 1', () => {
+    const sinceMs = 1779853984001;
+    const entries = [
+      { attestor_changed_at: 1779853984 },
+      { attestor_changed_at: 1779854018 }
+    ];
+    assert.equal(computeNextSinceMs(entries, sinceMs), 1779854018001);
   });
 
-  it('computeNextSinceMs uses server next_since_ms when present', () => {
-    const next = computeNextSinceMs([], { next_since_ms: 1779731766001 }, 1000);
-    assert.equal(next, 1779731766001);
+  it('does not move cursor backward', () => {
+    const sinceMs = 1779855000001;
+    const entries = [{ attestor_changed_at: 1779853984 }];
+    assert.equal(computeNextSinceMs(entries, sinceMs), sinceMs);
   });
 
-  it('computeNextSinceMs uses max attestor_changed_at + 1 when no server cursor', () => {
-    const entries = [{ attestor_changed_at: 1779728142 }];
-    const next = computeNextSinceMs(entries, {}, 1000);
-    assert.equal(next, 1779728142001);
+  it('trackMaxAttestorChangedSec accumulates across batches', () => {
+    let max = 0;
+    max = trackMaxAttestorChangedSec([{ attestor_changed_at: 100 }], max);
+    max = trackMaxAttestorChangedSec([{ attestor_changed_at: 200 }], max);
+    assert.equal(sinceMsFromMaxSec(max), 200001);
   });
 
-  it('ignores updated_at and last_seen_at for cursor', () => {
-    const row = {
-      updated_at: '2026-05-25T10:00:01.000Z',
-      last_seen_at: 1999999999,
-      profile_updated_at: 0,
-      wot_updated_at: 0
-    };
-    assert.equal(entryAttestorChangedMs(row), 0);
+  it('sinceMsFromMaxSec returns 0 when no rows', () => {
+    assert.equal(sinceMsFromMaxSec(0), 0);
   });
 });

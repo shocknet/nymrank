@@ -106,17 +106,57 @@ test('GET /api/users/:pubkey/activity validates pubkey', async (t) => {
 
 test('GET /api/status returns ok when db query succeeds', async (t) => {
   const app = await buildApiApp({
-    query: async () => ({ rows: [{ '?column?': 1 }] })
+    query: async (sql) => {
+      if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] }
+      if (String(sql).includes('bxrd_sync_state')) {
+        return {
+          rows: [{
+            last_since_ms: Date.now(),
+            last_snapshot_etag: 'etag',
+            last_snapshot_at: new Date(),
+            last_delta_at: new Date()
+          }]
+        }
+      }
+      if (String(sql).includes('COUNT(*)') && String(sql).includes('ranking_source')) {
+        return { rows: [{ count: 5000 }] }
+      }
+      if (String(sql).includes('precomputed_rankings')) {
+        return { rows: [{ count: 5000 }] }
+      }
+      if (String(sql).includes('LIMIT 1')) {
+        return { rows: [{ pubkey: 'a'.repeat(64) }] }
+      }
+      if (String(sql).includes('perspective_count')) {
+        return { rows: [{ average_rank: 40, perspective_count: 1 }] }
+      }
+      return { rows: [] }
+    }
   })
   t.after(() => app.close())
+
+  const prev = {
+    primary: process.env.BXRD_PRIMARY_SOURCE,
+    sync: process.env.BXRD_SYNC_ENABLED,
+    token: process.env.BXRD_ATTESTOR_BEARER_TOKEN,
+    url: process.env.BXRD_API_BASE_URL
+  }
+  process.env.BXRD_PRIMARY_SOURCE = 'false'
+  process.env.BXRD_SYNC_ENABLED = 'false'
 
   const res = await app.inject({
     method: 'GET',
     url: '/api/status'
   })
 
+  process.env.BXRD_PRIMARY_SOURCE = prev.primary
+  process.env.BXRD_SYNC_ENABLED = prev.sync
+  process.env.BXRD_ATTESTOR_BEARER_TOKEN = prev.token
+  process.env.BXRD_API_BASE_URL = prev.url
+
   assert.equal(res.statusCode, 200)
   const body = JSON.parse(res.payload)
   assert.equal(body.ok, true)
   assert.equal(body.service, 'nymrank-api')
+  assert.equal(body.checks.database.ok, true)
 })

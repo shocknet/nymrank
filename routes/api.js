@@ -6,6 +6,7 @@ const { runAdhocActivityCheck } = require('../services/activity-check');
 const { fetchActivityFromDb } = require('../services/bxrd-activity');
 const { fetchAggregatedNameSearch } = require('../services/aggregated-name-search');
 const { isBxrdPrimarySource, bxrdSourceFilterSql } = require('../services/bxrd-source');
+const { runHealthChecks } = require('../services/health-check');
 
 function sendApiError(reply, statusCode, code, message) {
   return reply.code(statusCode).send({
@@ -57,15 +58,14 @@ module.exports = async function (fastify) {
 
   fastify.get('/api/status', async (request, reply) => {
     try {
-      await database.query('SELECT 1');
-      return {
-        ok: true,
-        service: 'nymrank-api',
-        uptime_seconds: Math.floor(process.uptime())
-      };
+      const report = await runHealthChecks(database);
+      if (!report.ok) {
+        return reply.code(503).send(report);
+      }
+      return report;
     } catch (error) {
       request.log.error({ err: error }, 'API status check failed');
-      return sendApiError(reply, 503, 'db_unavailable', 'Database is unavailable');
+      return sendApiError(reply, 503, 'health_check_failed', 'Health check failed');
     }
   });
 
