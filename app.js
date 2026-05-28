@@ -144,6 +144,7 @@ server.register(require('@fastify/static'), {
 // --- Register routes ---
 server.register(require('./routes/web'));
 server.register(require('./routes/api'));
+server.register(require('./routes/bxrd-stats'));
 
 server.get('/api-docs', async (request, reply) => {
   return reply.sendFile('api-docs.html');

@@ -715,7 +715,11 @@ class Database {
     const fs = require('fs');
     const path = require('path');
     const migrationsDir = path.join(__dirname, '..', 'migrations');
-    for (const file of ['002_bxrd_sentinel.sql', '003_bxrd_ranking_source.sql']) {
+    for (const file of [
+      '002_bxrd_sentinel.sql',
+      '003_bxrd_ranking_source.sql',
+      '004_bxrd_stats_history.sql'
+    ]) {
       const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
       await this.pool.query(sql);
     }
@@ -731,6 +735,22 @@ class Database {
       last_snapshot_at: null,
       last_delta_at: null
     };
+  }
+
+  async logBxrdSyncRun(run) {
+    await this.query(
+      `INSERT INTO bxrd_sync_runs (
+        run_type, entries_count, since_ms, next_since_ms, snapshot_etag, duration_ms
+      ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        run.runType,
+        run.entriesCount ?? 0,
+        run.sinceMs ?? null,
+        run.nextSinceMs ?? null,
+        run.snapshotEtag ?? null,
+        run.durationMs ?? null
+      ]
+    );
   }
 
   async setBxrdSyncState(partial) {

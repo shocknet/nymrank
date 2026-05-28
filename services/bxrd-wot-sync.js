@@ -60,6 +60,7 @@ class BxrdWotSync {
    * Nightly reconcile (seedCursor false) refreshes rows but keeps last_since_ms from delta polls.
    */
   async ingestSnapshotStream(snapshot, { seedCursor }) {
+    const snapshotStarted = Date.now();
     const batch = [];
     const BATCH = 500;
     let lineCount = 0;
@@ -98,10 +99,27 @@ class BxrdWotSync {
       { lines: lineCount, etag: snapshot.etag, seedCursor, deltaSinceMs: syncPatch.last_since_ms ?? null },
       '[BXRD] Snapshot ingest complete (single materialized view refresh)'
     );
+
+    await this.logSyncRun('snapshot', {
+      entriesCount: lineCount,
+      snapshotEtag: snapshot.etag,
+      sinceMs: syncPatch.last_since_ms ?? null,
+      durationMs: Date.now() - snapshotStarted
+    });
+
     return { snapshot: true, lines: lineCount, etag: snapshot.etag };
   }
 
+  async logSyncRun(runType, fields) {
+    try {
+      await this.database.logBxrdSyncRun({ runType, ...fields });
+    } catch (err) {
+      this.log.warn({ err, runType }, '[BXRD] Failed to log sync run');
+    }
+  }
+
   async runDeltaPoll(state) {
+    const started = Date.now();
     let sinceMs = state.last_since_ms;
     if (sinceMs == null || sinceMs <= 0) {
       sinceMs = 0;
@@ -145,6 +163,14 @@ class BxrdWotSync {
       } else {
         this.log.info(logPayload, '[BXRD] Delta poll complete');
       }
+
+      await this.logSyncRun('delta', {
+        entriesCount: entries.length,
+        sinceMs,
+        nextSinceMs,
+        durationMs: Date.now() - started
+      });
+
       return { delta: true, entries: entries.length, repeatPubkeys: repeatCount };
     } catch (err) {
       if (err.statusCode === 400) {
